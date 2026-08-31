@@ -1,0 +1,29 @@
+{
+  "id": "com.mbgee.aiwriter",
+  "name": "MBGee AI Writer",
+  "main": "main.js",
+  "version": "2.0.0",
+  "readme": "readme.md",
+  "icon": "icon.png",
+  "changelogs": "changelogs.md",
+  "minVersionCode": 292,
+  "price": 0,
+  "license": "MIT",
+  "keywords": [
+    "ai",
+    "coding",
+    "code",
+    "assistant",
+    "cpp",
+    "python",
+    "javascript"
+  ],
+  "author": {
+    "name": "MBGee"
+  },
+  "contributors": [
+    {
+      "name": "macdonaldbarasa2026-del"
+    }
+  ]
+}
