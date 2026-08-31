@@ -1,18 +1,16 @@
 (function () {
-
     "use strict";
 
-    const pluginId = "com.mbgee.aiwriter";
-    const commandName = "mbgee-ai-writer";
+    const PLUGIN_ID = "com.mbgee.aiwriter";
+    const COMMAND_ID = "mbgee-ai-writer";
 
-    const STORAGE_KEY = "mbgee-ai-writer-settings";
+    const STORAGE_KEY = "mbgee-ai-writer-config";
 
     let page = null;
-    let controller = null;
-    let writing = false;
+    let abortController = null;
+    let running = false;
 
-    function settings() {
-
+    function getConfig() {
         try {
             return JSON.parse(
                 localStorage.getItem(STORAGE_KEY)
@@ -28,87 +26,83 @@
         }
     }
 
-    function saveSettings(data) {
-
+    function saveConfig(config) {
         localStorage.setItem(
             STORAGE_KEY,
-            JSON.stringify(data)
+            JSON.stringify(config)
         );
     }
 
-    function editor() {
+    function getEditor() {
         return editorManager.editor;
     }
 
-    function code() {
+    function getCurrentCode() {
+        const view = getEditor();
 
-        const view = editor();
-
-        if (!view) return "";
+        if (!view) {
+            return "";
+        }
 
         return view.state.doc.toString();
     }
 
-    function cursorPosition() {
+    function getCursor() {
+        const view = getEditor();
 
-        const view = editor();
-
-        if (!view) return 0;
+        if (!view) {
+            return 0;
+        }
 
         return view.state.selection.main.head;
     }
 
-    function insertAtCursor(text) {
+    function insertText(text) {
+        const view = getEditor();
 
-        const view = editor();
+        if (!view || !text) {
+            return;
+        }
 
-        if (!view) return;
-
-        const position =
-            cursorPosition();
+        const position = getCursor();
 
         view.dispatch({
-
             changes: {
                 from: position,
                 to: position,
                 insert: text
             },
-
             selection: {
-                anchor:
-                    position + text.length
+                anchor: position + text.length
             },
-
             scrollIntoView: true
         });
     }
 
-    function language() {
-
+    function getLanguage() {
         const file =
             editorManager.activeFile;
 
-        if (!file) return "unknown";
+        if (!file) {
+            return "unknown";
+        }
 
-        const name =
+        const filename =
             file.name ||
             file.filename ||
             "";
 
-        const ext =
-            name
+        const extension =
+            filename
                 .split(".")
                 .pop()
                 .toLowerCase();
 
-        const map = {
-
+        const languages = {
             cpp: "C++",
             cc: "C++",
             cxx: "C++",
             hpp: "C++",
-
             c: "C",
 
             py: "Python",
@@ -124,61 +118,64 @@
             html: "HTML",
             css: "CSS",
 
-            json: "JSON",
-
             php: "PHP",
 
             go: "Go",
 
             rs: "Rust",
 
-            kt: "Kotlin"
+            kt: "Kotlin",
+
+            json: "JSON"
         };
 
-        return map[ext] || ext || "unknown";
+        return languages[extension]
+            || extension
+            || "unknown";
     }
 
-    function promptForContinue() {
-
+    function buildPrompt(userPrompt) {
         return `
-You are MBGee Continue, an AI coding assistant inside Acode.
-
-Continue writing the code from the user's current cursor.
+You are MBGee Continue, an AI coding assistant running inside Acode.
 
 Programming language:
-${language()}
-
-Rules:
-
-1. Continue from the cursor.
-2. Do not rewrite the existing code.
-3. Do not repeat code that already exists.
-4. Return ONLY the code that should be inserted.
-5. Do not use Markdown fences.
-6. Match the existing coding style.
-7. Finish incomplete statements when appropriate.
-8. Add useful imports only when required.
-9. Do not explain the code.
-10. Write production-quality code.
+${getLanguage()}
 
 CURRENT FILE:
+${getCurrentCode()}
 
-${code()}
+USER REQUEST:
+${userPrompt}
 
-The cursor is at the insertion point.
+RULES:
 
-Generate only the next code.
+Continue from the user's current cursor.
+
+Return ONLY the code that should be inserted.
+
+Do not use Markdown code fences.
+
+Do not repeat existing code.
+
+Do not rewrite the whole file.
+
+Keep the existing programming style.
+
+If the code is incomplete, continue it correctly.
+
+Write real working code.
+
+No explanation.
 `;
     }
 
     async function streamGemini(
         apiKey,
-        onChunk,
+        prompt,
+        onText,
         signal
     ) {
-
-        const model =
-            "gemini-2.5-flash";
+        const model = "gemini-2.5-flash";
 
         const url =
             "https://generativelanguage.googleapis.com/v1beta/models/" +
@@ -187,67 +184,54 @@ Generate only the next code.
             encodeURIComponent(apiKey);
 
         const response =
-            await fetch(
-                url,
-                {
-                    method: "POST",
-
-                    signal,
-
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-
-                    body: JSON.stringify({
-
-                        contents: [
-
-                            {
-                                role: "user",
-
-                                parts: [
-
-                                    {
-                                        text:
-                                            promptForContinue()
-                                    }
-
-                                ]
-                            }
-
-                        ]
-                    })
-                }
-            );
+            await fetch(url, {
+                method: "POST",
+                signal,
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+                body: JSON.stringify({
+                    contents: [
+                        {
+                            role: "user",
+                            parts: [
+                                {
+                                    text: prompt
+                                }
+                            ]
+                        }
+                    ]
+                })
+            });
 
         if (!response.ok) {
-
             throw new Error(
                 await response.text()
             );
         }
 
-        await readSSE(
+        await readStream(
             response,
             async data => {
+                const parts =
+                    data.candidates
+                        ?.flatMap(
+                            candidate =>
+                                candidate.content
+                                    ?.parts || []
+                        ) || [];
 
                 const text =
-                    data.candidates
-                        ?.map(
-                            c =>
-                                c.content
-                                    ?.parts
-                                    ?.map(
-                                        p =>
-                                            p.text || ""
-                                    )
-                                    .join("")
+                    parts
+                        .map(
+                            part =>
+                                part.text || ""
                         )
-                        .join("") || "";
+                        .join("");
 
                 if (text) {
-                    await onChunk(text);
+                    await onText(text);
                 }
             }
         );
@@ -255,62 +239,48 @@ Generate only the next code.
 
     async function streamOpenAI(
         apiKey,
-        onChunk,
+        prompt,
+        onText,
         signal
     ) {
-
         const response =
             await fetch(
                 "https://api.openai.com/v1/responses",
                 {
                     method: "POST",
-
                     signal,
-
                     headers: {
-
                         "Content-Type":
                             "application/json",
-
                         "Authorization":
-                            "Bearer " +
-                            apiKey
+                            "Bearer " + apiKey
                     },
-
                     body: JSON.stringify({
-
-                        model:
-                            "gpt-5.5",
-
+                        model: "gpt-5.5",
                         stream: true,
-
                         instructions:
-                            promptForContinue(),
-
+                            prompt,
                         input:
-                            "Continue the code from the current cursor."
+                            "Continue the code."
                     })
                 }
             );
 
         if (!response.ok) {
-
             throw new Error(
                 await response.text()
             );
         }
 
-        await readSSE(
+        await readStream(
             response,
             async data => {
-
                 if (
                     data.type ===
                     "response.output_text.delta"
                 ) {
-
                     if (data.delta) {
-                        await onChunk(
+                        await onText(
                             data.delta
                         );
                     }
@@ -321,78 +291,59 @@ Generate only the next code.
 
     async function streamDeepSeek(
         apiKey,
-        onChunk,
+        prompt,
+        onText,
         signal
     ) {
-
         const response =
             await fetch(
                 "https://api.deepseek.com/chat/completions",
                 {
                     method: "POST",
-
                     signal,
-
                     headers: {
-
                         "Content-Type":
                             "application/json",
-
                         "Authorization":
-                            "Bearer " +
-                            apiKey
+                            "Bearer " + apiKey
                     },
-
                     body: JSON.stringify({
-
                         model:
                             "deepseek-chat",
 
                         stream: true,
 
                         messages: [
-
                             {
                                 role: "system",
-
                                 content:
-                                    promptForContinue()
+                                    prompt
                             },
-
                             {
                                 role: "user",
-
                                 content:
                                     "Continue the code."
                             }
-
                         ]
                     })
                 }
             );
 
         if (!response.ok) {
-
             throw new Error(
                 await response.text()
             );
         }
 
-        await readSSE(
+        await readStream(
             response,
             async data => {
-
                 const text =
-                    data.choices
-                        ?.map(
-                            c =>
-                                c.delta
-                                    ?.content || ""
-                        )
-                        .join("") || "";
+                    data.choices?.[0]
+                        ?.delta?.content || "";
 
                 if (text) {
-                    await onChunk(text);
+                    await onText(text);
                 }
             }
         );
@@ -400,20 +351,17 @@ Generate only the next code.
 
     async function streamClaude(
         apiKey,
-        onChunk,
+        prompt,
+        onText,
         signal
     ) {
-
         const response =
             await fetch(
                 "https://api.anthropic.com/v1/messages",
                 {
                     method: "POST",
-
                     signal,
-
                     headers: {
-
                         "Content-Type":
                             "application/json",
 
@@ -423,9 +371,7 @@ Generate only the next code.
                         "anthropic-version":
                             "2023-06-01"
                     },
-
                     body: JSON.stringify({
-
                         model:
                             "claude-sonnet-4-5",
 
@@ -435,57 +381,48 @@ Generate only the next code.
                         stream: true,
 
                         system:
-                            promptForContinue(),
+                            prompt,
 
                         messages: [
-
                             {
                                 role: "user",
-
                                 content:
                                     "Continue the code."
                             }
-
                         ]
                     })
                 }
             );
 
         if (!response.ok) {
-
             throw new Error(
                 await response.text()
             );
         }
 
-        await readSSE(
+        await readStream(
             response,
             async data => {
-
                 if (
                     data.type ===
                     "content_block_delta"
                 ) {
+                    const text =
+                        data.delta?.text ||
+                        "";
 
-                    if (
-                        data.delta &&
-                        data.delta.text
-                    ) {
-
-                        await onChunk(
-                            data.delta.text
-                        );
+                    if (text) {
+                        await onText(text);
                     }
                 }
             }
         );
     }
 
-    async function readSSE(
+    async function readStream(
         response,
         callback
     ) {
-
         const reader =
             response.body.getReader();
 
@@ -495,11 +432,12 @@ Generate only the next code.
         let buffer = "";
 
         while (true) {
-
             const result =
                 await reader.read();
 
-            if (result.done) break;
+            if (result.done) {
+                break;
+            }
 
             buffer += decoder.decode(
                 result.value,
@@ -517,14 +455,12 @@ Generate only the next code.
             for (
                 const event of events
             ) {
-
                 const lines =
                     event.split("\n");
 
                 for (
                     const line of lines
                 ) {
-
                     if (
                         !line.startsWith(
                             "data:"
@@ -533,46 +469,33 @@ Generate only the next code.
                         continue;
                     }
 
-                    const raw =
+                    const value =
                         line
                             .slice(5)
                             .trim();
 
                     if (
-                        !raw ||
-                        raw === "[DONE]"
+                        !value ||
+                        value === "[DONE]"
                     ) {
                         continue;
                     }
 
                     try {
-
-                        const data =
-                            JSON.parse(
-                                raw
-                            );
-
                         await callback(
-                            data
+                            JSON.parse(value)
                         );
-
                     } catch {
-
-                        /*
-                            Ignore malformed or
-                            incomplete SSE packets.
-                        */
                     }
                 }
             }
         }
     }
 
-    async function writeHuman(
+    async function humanTyping(
         text,
         status
     ) {
-
         let buffer = "";
 
         for (
@@ -580,63 +503,45 @@ Generate only the next code.
             i < text.length;
             i++
         ) {
-
-            if (!writing) {
+            if (!running) {
                 break;
             }
 
             buffer += text[i];
 
-            /*
-                Insert small chunks rather
-                than resetting the document.
-            */
-
             if (
                 buffer.length >= 2 ||
                 text[i] === "\n"
             ) {
-
-                insertAtCursor(
-                    buffer
-                );
-
+                insertText(buffer);
                 buffer = "";
-
-                status.textContent =
-                    "Writing...";
             }
-
-            let delay = 10;
 
             if (
                 text[i] === "\n"
             ) {
-                delay = 80;
-            }
-
-            if (
+                await sleep(80);
+            } else if (
                 text[i] === " "
             ) {
-                delay = 4;
+                await sleep(4);
+            } else {
+                await sleep(10);
             }
 
-            await sleep(delay);
+            status.textContent =
+                "MBGee is writing...";
         }
 
         if (
             buffer &&
-            writing
+            running
         ) {
-
-            insertAtCursor(
-                buffer
-            );
+            insertText(buffer);
         }
     }
 
     function sleep(ms) {
-
         return new Promise(
             resolve =>
                 setTimeout(
@@ -646,182 +551,169 @@ Generate only the next code.
         );
     }
 
-    async function continueWriting() {
+    async function startWriting() {
+        if (running) {
+            return;
+        }
 
-        if (writing) return;
+        const config =
+            getConfig();
 
-        const cfg =
-            settings();
-
-        if (!cfg.apiKey) {
-
+        if (!config.apiKey) {
             openSettings();
-
             return;
         }
 
-        if (!editor()) {
-
+        if (!getEditor()) {
             alert(
-                "Open a code file first."
+                "Open a code file in Acode first."
             );
-
             return;
         }
 
-        writing = true;
-
-        controller =
-            new AbortController();
+        const promptInput =
+            page.querySelector(
+                "#mbgee-prompt"
+            );
 
         const status =
             page.querySelector(
-                "#status"
+                "#mbgee-status"
             );
 
+        const userPrompt =
+            promptInput.value.trim()
+            || "Continue writing the code.";
+
+        running = true;
+
+        abortController =
+            new AbortController();
+
         status.textContent =
-            "AI is thinking...";
+            "Connecting to " +
+            config.provider +
+            "...";
 
         try {
+            const prompt =
+                buildPrompt(
+                    userPrompt
+                );
 
-            const writeQueue = [];
+            const queue = [];
 
-            let activeWriter = false;
+            let consuming = false;
 
-            const consume =
+            const receive =
                 async text => {
+                    queue.push(text);
 
-                    writeQueue.push(
-                        text
-                    );
-
-                    if (
-                        activeWriter
-                    ) {
+                    if (consuming) {
                         return;
                     }
 
-                    activeWriter = true;
+                    consuming = true;
 
                     while (
-                        writeQueue.length &&
-                        writing
+                        queue.length &&
+                        running
                     ) {
-
                         const next =
-                            writeQueue.shift();
+                            queue.shift();
 
-                        await writeHuman(
+                        await humanTyping(
                             next,
                             status
                         );
                     }
 
-                    activeWriter = false;
+                    consuming = false;
                 };
 
             if (
-                cfg.provider ===
+                config.provider ===
                 "gemini"
             ) {
-
                 await streamGemini(
-                    cfg.apiKey,
-                    consume,
-                    controller.signal
+                    config.apiKey,
+                    prompt,
+                    receive,
+                    abortController.signal
                 );
-
             } else if (
-                cfg.provider ===
+                config.provider ===
                 "openai"
             ) {
-
                 await streamOpenAI(
-                    cfg.apiKey,
-                    consume,
-                    controller.signal
+                    config.apiKey,
+                    prompt,
+                    receive,
+                    abortController.signal
                 );
-
             } else if (
-                cfg.provider ===
+                config.provider ===
                 "deepseek"
             ) {
-
                 await streamDeepSeek(
-                    cfg.apiKey,
-                    consume,
-                    controller.signal
+                    config.apiKey,
+                    prompt,
+                    receive,
+                    abortController.signal
                 );
-
             } else if (
-                cfg.provider ===
+                config.provider ===
                 "claude"
             ) {
-
                 await streamClaude(
-                    cfg.apiKey,
-                    consume,
-                    controller.signal
-                );
-
-            } else {
-
-                throw new Error(
-                    "Unknown provider."
+                    config.apiKey,
+                    prompt,
+                    receive,
+                    abortController.signal
                 );
             }
 
             while (
-                writeQueue.length &&
-                writing
+                queue.length &&
+                running
             ) {
-
                 await sleep(20);
             }
 
-            if (writing) {
-
+            if (running) {
                 status.textContent =
-                    "✓ Continue finished.";
+                    "✓ Finished.";
             }
 
         } catch (error) {
-
             if (
                 error.name ===
                 "AbortError"
             ) {
-
                 status.textContent =
                     "Stopped.";
-
             } else {
-
                 status.textContent =
                     "Error: " +
                     error.message;
             }
-
-        } finally {
-
-            writing = false;
-            controller = null;
         }
+
+        running = false;
+        abortController = null;
     }
 
     function stopWriting() {
+        running = false;
 
-        writing = false;
-
-        if (controller) {
-            controller.abort();
+        if (abortController) {
+            abortController.abort();
         }
 
         if (page) {
-
             const status =
                 page.querySelector(
-                    "#status"
+                    "#mbgee-status"
                 );
 
             if (status) {
@@ -832,21 +724,23 @@ Generate only the next code.
     }
 
     function openSettings() {
-
-        const cfg =
-            settings();
+        const config =
+            getConfig();
 
         page.innerHTML = `
-
-            <div class="mbgee-panel">
+            <div class="mbgee-app">
 
                 <h2>MBGee AI Writer</h2>
 
-                <p>
-                    AI provider
+                <p class="subtitle">
+                    AI configuration
                 </p>
 
-                <select id="provider">
+                <label>
+                    Provider
+                </label>
+
+                <select id="mbgee-provider">
 
                     <option value="gemini">
                         Gemini
@@ -866,26 +760,31 @@ Generate only the next code.
 
                 </select>
 
-                <p>
-                    API key
-                </p>
+                <label>
+                    API Key
+                </label>
 
                 <input
-                    id="apiKey"
+                    id="mbgee-key"
                     type="password"
-                    placeholder="Paste API key"
+                    placeholder="Paste API key here"
                 />
 
                 <button
-                    id="save"
+                    id="mbgee-save"
                     class="primary"
                 >
-                    Save
+                    Save API Key
                 </button>
 
-                <button id="back">
+                <button id="mbgee-back">
                     Back
                 </button>
+
+                <p class="small">
+                    Your API key is stored locally
+                    on this device.
+                </p>
 
             </div>
         `;
@@ -893,29 +792,27 @@ Generate only the next code.
         page.show();
 
         page.querySelector(
-            "#provider"
+            "#mbgee-provider"
         ).value =
-            cfg.provider;
+            config.provider;
 
         page.querySelector(
-            "#apiKey"
+            "#mbgee-key"
         ).value =
-            cfg.apiKey;
+            config.apiKey;
 
         page.querySelector(
-            "#save"
+            "#mbgee-save"
         ).onclick = () => {
-
-            saveSettings({
-
+            saveConfig({
                 provider:
                     page.querySelector(
-                        "#provider"
+                        "#mbgee-provider"
                     ).value,
 
                 apiKey:
                     page.querySelector(
-                        "#apiKey"
+                        "#mbgee-key"
                     ).value.trim()
             });
 
@@ -923,100 +820,95 @@ Generate only the next code.
         };
 
         page.querySelector(
-            "#back"
+            "#mbgee-back"
         ).onclick =
             openWriter;
     }
 
     function openWriter() {
-
-        const cfg =
-            settings();
+        const config =
+            getConfig();
 
         page.innerHTML = `
+            <div class="mbgee-app">
 
-            <div class="mbgee-panel">
-
-                <div class="top">
+                <div class="mbgee-header">
 
                     <div>
-
-                        <strong>
+                        <h2>
                             MBGee Continue
-                        </strong>
+                        </h2>
 
-                        <small>
-                            Human-time AI coding
-                        </small>
-
+                        <p>
+                            AI coding assistant
+                        </p>
                     </div>
 
-                    <button id="settings">
+                    <button id="mbgee-settings">
                         ⚙
                     </button>
 
                 </div>
 
+                <label>
+                    Your instruction
+                </label>
+
+                <textarea
+                    id="mbgee-prompt"
+                    placeholder="Tell MBGee what you want to write..."
+                ></textarea>
+
                 <button
-                    id="continue"
-                    class="continue"
+                    id="mbgee-continue"
+                    class="primary big"
                 >
                     Continue Writing
                 </button>
 
                 <button
-                    id="stop"
-                    class="stop"
+                    id="mbgee-stop"
                 >
                     Stop
                 </button>
 
-                <textarea
-                    id="prompt"
-                    placeholder="Optional instruction..."
-                ></textarea>
+                <div class="buttons">
 
-                <div class="actions">
-
-                    <button id="generate">
+                    <button id="mbgee-generate">
                         Generate
                     </button>
 
-                    <button id="fix">
+                    <button id="mbgee-fix">
                         Fix
                     </button>
 
-                    <button id="complete">
+                    <button id="mbgee-complete">
                         Complete
                     </button>
 
                 </div>
 
                 <div
-                    id="status"
+                    id="mbgee-status"
                     class="status"
                 >
                     ${
-                        cfg.apiKey
+                        config.apiKey
                         ? "Ready."
                         : "API key required."
                     }
                 </div>
 
-                <div class="provider">
-
+                <div class="info">
                     Provider:
                     <b>
-                        ${cfg.provider}
+                        ${config.provider}
                     </b>
-
                 </div>
 
                 <div class="contributor">
-
                     Contributor:
                     macdonaldbarasa2026-del
-
                 </div>
 
             </div>
@@ -1025,78 +917,163 @@ Generate only the next code.
         page.show();
 
         page.querySelector(
-            "#settings"
+            "#mbgee-settings"
         ).onclick =
             openSettings;
 
         page.querySelector(
-            "#continue"
+            "#mbgee-continue"
         ).onclick =
-            async () => {
-
-                const extra =
-                    page.querySelector(
-                        "#prompt"
-                    ).value.trim();
-
-                if (extra) {
-
-                    /*
-                        Add the instruction to the
-                        Continue prompt by temporarily
-                        modifying the current request.
-                    */
-
-                    window.mbgeeExtra =
-                        extra;
-                }
-
-                await continueWriting();
-            };
+            startWriting;
 
         page.querySelector(
-            "#stop"
+            "#mbgee-stop"
         ).onclick =
             stopWriting;
 
         page.querySelector(
-            "#generate"
-        ).onclick =
-            () => {
+            "#mbgee-generate"
+        ).onclick = () => {
+            page.querySelector(
+                "#mbgee-prompt"
+            ).value =
+                "Generate the code I describe.";
 
-                page.querySelector(
-                    "#prompt"
-                ).value =
-                    "Generate the requested code.";
-
-                continueWriting();
-            };
+            startWriting();
+        };
 
         page.querySelector(
-            "#fix"
-        ).onclick =
-            () => {
+            "#mbgee-fix"
+        ).onclick = () => {
+            page.querySelector(
+                "#mbgee-prompt"
+            ).value =
+                "Fix the current code and continue.";
 
-                page.querySelector(
-                    "#prompt"
-                ).value =
-                    "Fix the current code and continue from the cursor.";
-
-                continueWriting();
-            };
+            startWriting();
+        };
 
         page.querySelector(
-            "#complete"
-        ).onclick =
-            () => {
+            "#mbgee-complete"
+        ).onclick = () => {
+            page.querySelector(
+                "#mbgee-prompt"
+            ).value =
+                "Complete the current code from the cursor.";
 
-                page.querySelector(
-                    "#prompt"
-                ).value =
-                    "Complete the current code from the cursor.";
+            startWriting();
+        };
+    }
 
-                continueWriting();
-            };
+    function addStyles() {
+        const style =
+            document.createElement(
+                "style"
+            );
+
+        style.textContent = `
+            .mbgee-app {
+                padding: 16px;
+                font-family: sans-serif;
+            }
+
+            .mbgee-app h2 {
+                margin: 0 0 4px;
+            }
+
+            .subtitle {
+                opacity: .7;
+                margin-top: 0;
+            }
+
+            .mbgee-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+
+            .mbgee-app label {
+                display: block;
+                margin-top: 16px;
+                margin-bottom: 6px;
+            }
+
+            .mbgee-app input,
+            .mbgee-app textarea,
+            .mbgee-app select {
+                width: 100%;
+                box-sizing: border-box;
+                padding: 12px;
+                border-radius: 8px;
+                border: 1px solid #777;
+                background: transparent;
+                color: inherit;
+                font-size: 15px;
+            }
+
+            .mbgee-app textarea {
+                min-height: 110px;
+                resize: vertical;
+            }
+
+            .mbgee-app button {
+                padding: 11px 14px;
+                margin-top: 10px;
+                border-radius: 8px;
+                border: 1px solid #777;
+                background: transparent;
+                color: inherit;
+                font-size: 14px;
+            }
+
+            .mbgee-app button.primary {
+                width: 100%;
+                border: 0;
+                font-weight: bold;
+            }
+
+            .mbgee-app button.big {
+                padding: 15px;
+                font-size: 16px;
+            }
+
+            .mbgee-app .buttons {
+                display: flex;
+                gap: 7px;
+            }
+
+            .mbgee-app .buttons button {
+                flex: 1;
+            }
+
+            .status {
+                margin-top: 16px;
+                padding: 10px;
+                border-radius: 8px;
+                background: rgba(128,128,128,.15);
+            }
+
+            .info {
+                margin-top: 12px;
+                opacity: .8;
+            }
+
+            .contributor {
+                margin-top: 20px;
+                font-size: 12px;
+                opacity: .6;
+                text-align: center;
+            }
+
+            .small {
+                font-size: 12px;
+                opacity: .6;
+            }
+        `;
+
+        document.head.appendChild(
+            style
+        );
     }
 
     function init(
@@ -1104,8 +1081,11 @@ Generate only the next code.
         $page,
         cache
     ) {
-
         page = $page;
+
+        addStyles();
+
+        openWriter();
 
         const commands =
             acode.require(
@@ -1113,20 +1093,14 @@ Generate only the next code.
             );
 
         commands.addCommand({
-
-            name:
-                commandName,
-
+            name: COMMAND_ID,
             description:
-                "Open MBGee Continue",
-
-            exec:
-                openWriter
+                "Open MBGee AI Writer",
+            exec: openWriter
         });
     }
 
     function unmount() {
-
         stopWriting();
 
         const commands =
@@ -1135,17 +1109,17 @@ Generate only the next code.
             );
 
         commands.removeCommand(
-            commandName
+            COMMAND_ID
         );
     }
 
     acode.setPluginInit(
-        pluginId,
+        PLUGIN_ID,
         init
     );
 
     acode.setPluginUnmount(
-        pluginId,
+        PLUGIN_ID,
         unmount
     );
 
