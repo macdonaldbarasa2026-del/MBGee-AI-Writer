@@ -3,33 +3,49 @@
 
     const PLUGIN_ID = "com.mbgee.aiwriter";
     const COMMAND_ID = "mbgee-ai-writer";
+    const STORAGE_KEY = "mbgee-ai-writer-v3";
 
-    const STORAGE_KEY = "mbgee-ai-writer-config";
-
-    let page = null;
+    let page;
     let abortController = null;
-    let running = false;
+    let isRunning = false;
 
-    function getConfig() {
+    const DEFAULTS = {
+        provider: "gemini",
+        keys: {
+            gemini: "",
+            openai: "",
+            claude: "",
+            deepseek: ""
+        }
+    };
+
+    function loadSettings() {
         try {
-            return JSON.parse(
+            const saved = JSON.parse(
                 localStorage.getItem(STORAGE_KEY)
-            ) || {
-                provider: "gemini",
-                apiKey: ""
+            );
+
+            return {
+                provider:
+                    saved?.provider ||
+                    DEFAULTS.provider,
+
+                keys: {
+                    ...DEFAULTS.keys,
+                    ...(saved?.keys || {})
+                }
             };
         } catch {
-            return {
-                provider: "gemini",
-                apiKey: ""
-            };
+            return JSON.parse(
+                JSON.stringify(DEFAULTS)
+            );
         }
     }
 
-    function saveConfig(config) {
+    function saveSettings(settings) {
         localStorage.setItem(
             STORAGE_KEY,
-            JSON.stringify(config)
+            JSON.stringify(settings)
         );
     }
 
@@ -37,63 +53,23 @@
         return editorManager.editor;
     }
 
-    function getCurrentCode() {
-        const view = getEditor();
-
-        if (!view) {
-            return "";
-        }
-
-        return view.state.doc.toString();
-    }
-
-    function getCursor() {
-        const view = getEditor();
-
-        if (!view) {
-            return 0;
-        }
-
-        return view.state.selection.main.head;
-    }
-
-    function insertText(text) {
-        const view = getEditor();
-
-        if (!view || !text) {
-            return;
-        }
-
-        const position = getCursor();
-
-        view.dispatch({
-            changes: {
-                from: position,
-                to: position,
-                insert: text
-            },
-            selection: {
-                anchor: position + text.length
-            },
-            scrollIntoView: true
-        });
-    }
-
-    function getLanguage() {
+    function getFileName() {
         const file =
             editorManager.activeFile;
 
-        if (!file) {
-            return "unknown";
-        }
+        return (
+            file?.name ||
+            file?.filename ||
+            "untitled"
+        );
+    }
 
-        const filename =
-            file.name ||
-            file.filename ||
-            "";
+    function getLanguage() {
+        const name =
+            getFileName();
 
-        const extension =
-            filename
+        const ext =
+            name
                 .split(".")
                 .pop()
                 .toLowerCase();
@@ -113,313 +89,197 @@
             ts: "TypeScript",
             tsx: "TypeScript",
 
-            java: "Java",
-
             html: "HTML",
             css: "CSS",
 
-            php: "PHP",
+            java: "Java",
+
+            kt: "Kotlin",
 
             go: "Go",
 
             rs: "Rust",
 
-            kt: "Kotlin",
+            php: "PHP",
 
             json: "JSON"
         };
 
-        return languages[extension]
-            || extension
-            || "unknown";
+        return (
+            languages[ext] ||
+            ext ||
+            "text"
+        );
     }
 
-    function buildPrompt(userPrompt) {
+    function getCode() {
+        const view =
+            getEditor();
+
+        if (!view) {
+            return "";
+        }
+
+        return view.state.doc.toString();
+    }
+
+    function getSelection() {
+        const view =
+            getEditor();
+
+        if (!view) {
+            return "";
+        }
+
+        const selection =
+            view.state.selection.main;
+
+        return view.state.doc.sliceString(
+            selection.from,
+            selection.to
+        );
+    }
+
+    function getCursor() {
+        const view =
+            getEditor();
+
+        if (!view) {
+            return 0;
+        }
+
+        return view.state.selection.main.head;
+    }
+
+    function insertAtCursor(text) {
+        const view =
+            getEditor();
+
+        if (!view || !text) {
+            return;
+        }
+
+        const position =
+            getCursor();
+
+        view.dispatch({
+            changes: {
+                from: position,
+                to: position,
+                insert: text
+            },
+
+            selection: {
+                anchor:
+                    position + text.length
+            },
+
+            scrollIntoView: true
+        });
+    }
+
+    function replaceSelection(text) {
+        const view =
+            getEditor();
+
+        if (!view) {
+            return;
+        }
+
+        const selection =
+            view.state.selection.main;
+
+        view.dispatch({
+            changes: {
+                from: selection.from,
+                to: selection.to,
+                insert: text
+            },
+
+            selection: {
+                anchor:
+                    selection.from +
+                    text.length
+            }
+        });
+    }
+
+    function buildSystemPrompt() {
         return `
-You are MBGee Continue, an AI coding assistant running inside Acode.
+You are MBGee AI, an AI coding assistant
+inside the Acode mobile code editor.
+
+Current file:
+${getFileName()}
 
 Programming language:
 ${getLanguage()}
 
-CURRENT FILE:
-${getCurrentCode()}
+You can help with:
+- writing code
+- completing code
+- fixing code
+- explaining code
+- refactoring
+- debugging
+- improving code
+- continuing from the cursor
 
-USER REQUEST:
-${userPrompt}
+When the user asks for code to be inserted,
+return only the code.
 
-RULES:
+Do not use Markdown fences when returning
+code intended for the editor.
 
-Continue from the user's current cursor.
+Respect the existing code.
 
-Return ONLY the code that should be inserted.
-
-Do not use Markdown code fences.
-
-Do not repeat existing code.
-
-Do not rewrite the whole file.
-
-Keep the existing programming style.
-
-If the code is incomplete, continue it correctly.
-
-Write real working code.
-
-No explanation.
+Do not unnecessarily rewrite the entire file.
 `;
     }
 
-    async function streamGemini(
-        apiKey,
-        prompt,
-        onText,
-        signal
-    ) {
-        const model = "gemini-2.5-flash";
+    function buildContinuePrompt(instruction) {
+        return `
+${buildSystemPrompt()}
 
-        const url =
-            "https://generativelanguage.googleapis.com/v1beta/models/" +
-            model +
-            ":streamGenerateContent?alt=sse&key=" +
-            encodeURIComponent(apiKey);
+CURRENT FILE:
 
-        const response =
-            await fetch(url, {
-                method: "POST",
-                signal,
-                headers: {
-                    "Content-Type":
-                        "application/json"
-                },
-                body: JSON.stringify({
-                    contents: [
-                        {
-                            role: "user",
-                            parts: [
-                                {
-                                    text: prompt
-                                }
-                            ]
-                        }
-                    ]
-                })
-            });
+${getCode()}
 
-        if (!response.ok) {
-            throw new Error(
-                await response.text()
-            );
-        }
+USER INSTRUCTION:
 
-        await readStream(
-            response,
-            async data => {
-                const parts =
-                    data.candidates
-                        ?.flatMap(
-                            candidate =>
-                                candidate.content
-                                    ?.parts || []
-                        ) || [];
+${instruction || "Continue writing from the cursor."}
 
-                const text =
-                    parts
-                        .map(
-                            part =>
-                                part.text || ""
-                        )
-                        .join("");
+IMPORTANT:
 
-                if (text) {
-                    await onText(text);
-                }
-            }
-        );
+Continue from the current cursor position.
+
+Return ONLY the new code that should be
+inserted at the cursor.
+
+Do not repeat code that already exists.
+Do not explain anything.
+`;
     }
 
-    async function streamOpenAI(
-        apiKey,
-        prompt,
-        onText,
-        signal
-    ) {
-        const response =
-            await fetch(
-                "https://api.openai.com/v1/responses",
-                {
-                    method: "POST",
-                    signal,
-                    headers: {
-                        "Content-Type":
-                            "application/json",
-                        "Authorization":
-                            "Bearer " + apiKey
-                    },
-                    body: JSON.stringify({
-                        model: "gpt-5.5",
-                        stream: true,
-                        instructions:
-                            prompt,
-                        input:
-                            "Continue the code."
-                    })
-                }
-            );
+    function buildChatPrompt(message) {
+        return `
+${buildSystemPrompt()}
 
-        if (!response.ok) {
-            throw new Error(
-                await response.text()
-            );
-        }
+CURRENT FILE:
 
-        await readStream(
-            response,
-            async data => {
-                if (
-                    data.type ===
-                    "response.output_text.delta"
-                ) {
-                    if (data.delta) {
-                        await onText(
-                            data.delta
-                        );
-                    }
-                }
-            }
-        );
+${getCode()}
+
+SELECTED CODE:
+
+${getSelection() || "(nothing selected)"}
+
+USER:
+
+${message}
+`;
     }
 
-    async function streamDeepSeek(
-        apiKey,
-        prompt,
-        onText,
-        signal
-    ) {
-        const response =
-            await fetch(
-                "https://api.deepseek.com/chat/completions",
-                {
-                    method: "POST",
-                    signal,
-                    headers: {
-                        "Content-Type":
-                            "application/json",
-                        "Authorization":
-                            "Bearer " + apiKey
-                    },
-                    body: JSON.stringify({
-                        model:
-                            "deepseek-chat",
-
-                        stream: true,
-
-                        messages: [
-                            {
-                                role: "system",
-                                content:
-                                    prompt
-                            },
-                            {
-                                role: "user",
-                                content:
-                                    "Continue the code."
-                            }
-                        ]
-                    })
-                }
-            );
-
-        if (!response.ok) {
-            throw new Error(
-                await response.text()
-            );
-        }
-
-        await readStream(
-            response,
-            async data => {
-                const text =
-                    data.choices?.[0]
-                        ?.delta?.content || "";
-
-                if (text) {
-                    await onText(text);
-                }
-            }
-        );
-    }
-
-    async function streamClaude(
-        apiKey,
-        prompt,
-        onText,
-        signal
-    ) {
-        const response =
-            await fetch(
-                "https://api.anthropic.com/v1/messages",
-                {
-                    method: "POST",
-                    signal,
-                    headers: {
-                        "Content-Type":
-                            "application/json",
-
-                        "x-api-key":
-                            apiKey,
-
-                        "anthropic-version":
-                            "2023-06-01"
-                    },
-                    body: JSON.stringify({
-                        model:
-                            "claude-sonnet-4-5",
-
-                        max_tokens:
-                            12000,
-
-                        stream: true,
-
-                        system:
-                            prompt,
-
-                        messages: [
-                            {
-                                role: "user",
-                                content:
-                                    "Continue the code."
-                            }
-                        ]
-                    })
-                }
-            );
-
-        if (!response.ok) {
-            throw new Error(
-                await response.text()
-            );
-        }
-
-        await readStream(
-            response,
-            async data => {
-                if (
-                    data.type ===
-                    "content_block_delta"
-                ) {
-                    const text =
-                        data.delta?.text ||
-                        "";
-
-                    if (text) {
-                        await onText(text);
-                    }
-                }
-            }
-        );
-    }
-
-    async function readStream(
+    async function readSSE(
         response,
         callback
     ) {
@@ -469,30 +329,385 @@ No explanation.
                         continue;
                     }
 
-                    const value =
+                    const raw =
                         line
                             .slice(5)
                             .trim();
 
                     if (
-                        !value ||
-                        value === "[DONE]"
+                        !raw ||
+                        raw === "[DONE]"
                     ) {
                         continue;
                     }
 
                     try {
                         await callback(
-                            JSON.parse(value)
+                            JSON.parse(raw)
                         );
                     } catch {
+                        // Ignore incomplete SSE data.
                     }
                 }
             }
         }
     }
 
-    async function humanTyping(
+    async function askGemini(
+        key,
+        prompt,
+        onText,
+        signal
+    ) {
+        const url =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=" +
+            encodeURIComponent(key);
+
+        const response =
+            await fetch(url, {
+                method: "POST",
+
+                signal,
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body: JSON.stringify({
+                    systemInstruction: {
+                        parts: [
+                            {
+                                text:
+                                    buildSystemPrompt()
+                            }
+                        ]
+                    },
+
+                    contents: [
+                        {
+                            role: "user",
+
+                            parts: [
+                                {
+                                    text:
+                                        prompt
+                                }
+                            ]
+                        }
+                    ]
+                })
+            });
+
+        if (!response.ok) {
+            throw new Error(
+                "Gemini: " +
+                await response.text()
+            );
+        }
+
+        await readSSE(
+            response,
+            async data => {
+                const text =
+                    data.candidates
+                        ?.flatMap(
+                            c =>
+                                c.content
+                                    ?.parts ||
+                                []
+                        )
+                        ?.map(
+                            p =>
+                                p.text || ""
+                        )
+                        ?.join("") || "";
+
+                if (text) {
+                    await onText(text);
+                }
+            }
+        );
+    }
+
+    async function askOpenAI(
+        key,
+        prompt,
+        onText,
+        signal
+    ) {
+        const response =
+            await fetch(
+                "https://api.openai.com/v1/responses",
+                {
+                    method: "POST",
+
+                    signal,
+
+                    headers: {
+                        "Content-Type":
+                            "application/json",
+
+                        "Authorization":
+                            "Bearer " + key
+                    },
+
+                    body: JSON.stringify({
+                        model: "gpt-5.5",
+
+                        stream: true,
+
+                        instructions:
+                            buildSystemPrompt(),
+
+                        input: prompt
+                    })
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                "OpenAI: " +
+                await response.text()
+            );
+        }
+
+        await readSSE(
+            response,
+            async data => {
+                if (
+                    data.type ===
+                    "response.output_text.delta"
+                ) {
+                    if (data.delta) {
+                        await onText(
+                            data.delta
+                        );
+                    }
+                }
+            }
+        );
+    }
+
+    async function askDeepSeek(
+        key,
+        prompt,
+        onText,
+        signal
+    ) {
+        const response =
+            await fetch(
+                "https://api.deepseek.com/chat/completions",
+                {
+                    method: "POST",
+
+                    signal,
+
+                    headers: {
+                        "Content-Type":
+                            "application/json",
+
+                        "Authorization":
+                            "Bearer " + key
+                    },
+
+                    body: JSON.stringify({
+                        model:
+                            "deepseek-chat",
+
+                        stream: true,
+
+                        messages: [
+                            {
+                                role:
+                                    "system",
+
+                                content:
+                                    buildSystemPrompt()
+                            },
+
+                            {
+                                role:
+                                    "user",
+
+                                content:
+                                    prompt
+                            }
+                        ]
+                    })
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                "DeepSeek: " +
+                await response.text()
+            );
+        }
+
+        await readSSE(
+            response,
+            async data => {
+                const text =
+                    data.choices?.[0]
+                        ?.delta?.content ||
+                    "";
+
+                if (text) {
+                    await onText(text);
+                }
+            }
+        );
+    }
+
+    async function askClaude(
+        key,
+        prompt,
+        onText,
+        signal
+    ) {
+        const response =
+            await fetch(
+                "https://api.anthropic.com/v1/messages",
+                {
+                    method: "POST",
+
+                    signal,
+
+                    headers: {
+                        "Content-Type":
+                            "application/json",
+
+                        "x-api-key":
+                            key,
+
+                        "anthropic-version":
+                            "2023-06-01"
+                    },
+
+                    body: JSON.stringify({
+                        model:
+                            "claude-sonnet-4-5",
+
+                        max_tokens:
+                            16000,
+
+                        stream: true,
+
+                        system:
+                            buildSystemPrompt(),
+
+                        messages: [
+                            {
+                                role:
+                                    "user",
+
+                                content:
+                                    prompt
+                            }
+                        ]
+                    })
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                "Claude: " +
+                await response.text()
+            );
+        }
+
+        await readSSE(
+            response,
+            async data => {
+                if (
+                    data.type ===
+                    "content_block_delta"
+                ) {
+                    const text =
+                        data.delta?.text ||
+                        "";
+
+                    if (text) {
+                        await onText(text);
+                    }
+                }
+            }
+        );
+    }
+
+    async function requestAI(
+        prompt,
+        onText
+    ) {
+        const config =
+            loadSettings();
+
+        const key =
+            config.keys[
+                config.provider
+            ];
+
+        if (!key) {
+            throw new Error(
+                "No API key configured for " +
+                config.provider
+            );
+        }
+
+        abortController =
+            new AbortController();
+
+        if (
+            config.provider ===
+            "gemini"
+        ) {
+            return askGemini(
+                key,
+                prompt,
+                onText,
+                abortController.signal
+            );
+        }
+
+        if (
+            config.provider ===
+            "openai"
+        ) {
+            return askOpenAI(
+                key,
+                prompt,
+                onText,
+                abortController.signal
+            );
+        }
+
+        if (
+            config.provider ===
+            "deepseek"
+        ) {
+            return askDeepSeek(
+                key,
+                prompt,
+                onText,
+                abortController.signal
+            );
+        }
+
+        if (
+            config.provider ===
+            "claude"
+        ) {
+            return askClaude(
+                key,
+                prompt,
+                onText,
+                abortController.signal
+            );
+        }
+    }
+
+    async function humanWrite(
         text,
         status
     ) {
@@ -503,7 +718,7 @@ No explanation.
             i < text.length;
             i++
         ) {
-            if (!running) {
+            if (!isRunning) {
                 break;
             }
 
@@ -513,20 +728,23 @@ No explanation.
                 buffer.length >= 2 ||
                 text[i] === "\n"
             ) {
-                insertText(buffer);
+                insertAtCursor(
+                    buffer
+                );
+
                 buffer = "";
             }
 
             if (
                 text[i] === "\n"
             ) {
-                await sleep(80);
+                await wait(70);
             } else if (
                 text[i] === " "
             ) {
-                await sleep(4);
+                await wait(3);
             } else {
-                await sleep(10);
+                await wait(9);
             }
 
             status.textContent =
@@ -535,13 +753,15 @@ No explanation.
 
         if (
             buffer &&
-            running
+            isRunning
         ) {
-            insertText(buffer);
+            insertAtCursor(
+                buffer
+            );
         }
     }
 
-    function sleep(ms) {
+    function wait(ms) {
         return new Promise(
             resolve =>
                 setTimeout(
@@ -551,44 +771,34 @@ No explanation.
         );
     }
 
-    async function startWriting() {
-        if (running) {
+    async function continueCode() {
+        if (isRunning) {
             return;
         }
 
         const config =
-            getConfig();
+            loadSettings();
 
-        if (!config.apiKey) {
+        if (
+            !config.keys[
+                config.provider
+            ]
+        ) {
             openSettings();
             return;
         }
 
-        if (!getEditor()) {
-            alert(
-                "Open a code file in Acode first."
-            );
-            return;
-        }
-
-        const promptInput =
+        const instruction =
             page.querySelector(
                 "#mbgee-prompt"
-            );
+            ).value.trim();
 
         const status =
             page.querySelector(
                 "#mbgee-status"
             );
 
-        const userPrompt =
-            promptInput.value.trim()
-            || "Continue writing the code.";
-
-        running = true;
-
-        abortController =
-            new AbortController();
+        isRunning = true;
 
         status.textContent =
             "Connecting to " +
@@ -596,96 +806,25 @@ No explanation.
             "...";
 
         try {
-            const prompt =
-                buildPrompt(
-                    userPrompt
-                );
-
-            const queue = [];
-
-            let consuming = false;
-
-            const receive =
+            await requestAI(
+                buildContinuePrompt(
+                    instruction
+                ),
                 async text => {
-                    queue.push(text);
+                    await humanWrite(
+                        text,
+                        status
+                    );
+                }
+            );
 
-                    if (consuming) {
-                        return;
-                    }
-
-                    consuming = true;
-
-                    while (
-                        queue.length &&
-                        running
-                    ) {
-                        const next =
-                            queue.shift();
-
-                        await humanTyping(
-                            next,
-                            status
-                        );
-                    }
-
-                    consuming = false;
-                };
-
-            if (
-                config.provider ===
-                "gemini"
-            ) {
-                await streamGemini(
-                    config.apiKey,
-                    prompt,
-                    receive,
-                    abortController.signal
-                );
-            } else if (
-                config.provider ===
-                "openai"
-            ) {
-                await streamOpenAI(
-                    config.apiKey,
-                    prompt,
-                    receive,
-                    abortController.signal
-                );
-            } else if (
-                config.provider ===
-                "deepseek"
-            ) {
-                await streamDeepSeek(
-                    config.apiKey,
-                    prompt,
-                    receive,
-                    abortController.signal
-                );
-            } else if (
-                config.provider ===
-                "claude"
-            ) {
-                await streamClaude(
-                    config.apiKey,
-                    prompt,
-                    receive,
-                    abortController.signal
-                );
-            }
-
-            while (
-                queue.length &&
-                running
-            ) {
-                await sleep(20);
-            }
-
-            if (running) {
+            if (isRunning) {
                 status.textContent =
                     "✓ Finished.";
             }
 
         } catch (error) {
+
             if (
                 error.name ===
                 "AbortError"
@@ -694,53 +833,146 @@ No explanation.
                     "Stopped.";
             } else {
                 status.textContent =
-                    "Error: " +
                     error.message;
             }
-        }
 
-        running = false;
-        abortController = null;
+        } finally {
+            isRunning = false;
+            abortController = null;
+        }
     }
 
-    function stopWriting() {
-        running = false;
+    function stop() {
+        isRunning = false;
 
         if (abortController) {
             abortController.abort();
         }
 
-        if (page) {
-            const status =
-                page.querySelector(
-                    "#mbgee-status"
-                );
+        const status =
+            page?.querySelector(
+                "#mbgee-status"
+            );
 
-            if (status) {
-                status.textContent =
-                    "Stopped.";
-            }
+        if (status) {
+            status.textContent =
+                "Stopped.";
         }
+    }
+
+    async function chat() {
+        const input =
+            page.querySelector(
+                "#mbgee-chat"
+            );
+
+        const output =
+            page.querySelector(
+                "#mbgee-chat-output"
+            );
+
+        const message =
+            input.value.trim();
+
+        if (!message) {
+            return;
+        }
+
+        const config =
+            loadSettings();
+
+        if (
+            !config.keys[
+                config.provider
+            ]
+        ) {
+            openSettings();
+            return;
+        }
+
+        input.value = "";
+
+        output.innerHTML +=
+            `<div class="user-msg">
+                <b>You:</b>
+                ${escapeHTML(message)}
+            </div>`;
+
+        output.innerHTML +=
+            `<div class="ai-msg" id="live-ai">
+                <b>MBGee:</b>
+                <span></span>
+            </div>`;
+
+        const live =
+            output.querySelector(
+                "#live-ai span"
+            );
+
+        try {
+            await requestAI(
+                buildChatPrompt(
+                    message
+                ),
+                async text => {
+                    live.textContent +=
+                        text;
+
+                    output.scrollTop =
+                        output.scrollHeight;
+                }
+            );
+        } catch (error) {
+            live.textContent =
+                error.message;
+        }
+    }
+
+    function escapeHTML(text) {
+        return text
+            .replace(
+                /&/g,
+                "&amp;"
+            )
+            .replace(
+                /</g,
+                "&lt;"
+            )
+            .replace(
+                />/g,
+                "&gt;"
+            )
+            .replace(
+                /"/g,
+                "&quot;"
+            )
+            .replace(
+                /'/g,
+                "&#039;"
+            );
     }
 
     function openSettings() {
         const config =
-            getConfig();
+            loadSettings();
 
         page.innerHTML = `
-            <div class="mbgee-app">
+            <div class="mbgee">
 
-                <h2>MBGee AI Writer</h2>
+                <div class="header">
+                    <div>
+                        <h2>MBGee AI</h2>
+                        <small>Settings</small>
+                    </div>
 
-                <p class="subtitle">
-                    AI configuration
-                </p>
+                    <button id="back">
+                        Back
+                    </button>
+                </div>
 
-                <label>
-                    Provider
-                </label>
+                <label>Default AI</label>
 
-                <select id="mbgee-provider">
+                <select id="provider">
 
                     <option value="gemini">
                         Gemini
@@ -761,29 +993,55 @@ No explanation.
                 </select>
 
                 <label>
-                    API Key
+                    Gemini API Key
                 </label>
 
                 <input
-                    id="mbgee-key"
+                    id="gemini"
                     type="password"
-                    placeholder="Paste API key here"
+                    placeholder="Gemini API key"
+                />
+
+                <label>
+                    OpenAI API Key
+                </label>
+
+                <input
+                    id="openai"
+                    type="password"
+                    placeholder="OpenAI API key"
+                />
+
+                <label>
+                    Claude API Key
+                </label>
+
+                <input
+                    id="claude"
+                    type="password"
+                    placeholder="Claude API key"
+                />
+
+                <label>
+                    DeepSeek API Key
+                </label>
+
+                <input
+                    id="deepseek"
+                    type="password"
+                    placeholder="DeepSeek API key"
                 />
 
                 <button
-                    id="mbgee-save"
+                    id="save"
                     class="primary"
                 >
-                    Save API Key
+                    Save Settings
                 </button>
 
-                <button id="mbgee-back">
-                    Back
-                </button>
-
-                <p class="small">
-                    Your API key is stored locally
-                    on this device.
+                <p class="privacy">
+                    API keys stay on this device
+                    in the plugin's local storage.
                 </p>
 
             </div>
@@ -792,123 +1050,211 @@ No explanation.
         page.show();
 
         page.querySelector(
-            "#mbgee-provider"
+            "#provider"
         ).value =
             config.provider;
 
         page.querySelector(
-            "#mbgee-key"
+            "#gemini"
         ).value =
-            config.apiKey;
+            config.keys.gemini;
 
         page.querySelector(
-            "#mbgee-save"
+            "#openai"
+        ).value =
+            config.keys.openai;
+
+        page.querySelector(
+            "#claude"
+        ).value =
+            config.keys.claude;
+
+        page.querySelector(
+            "#deepseek"
+        ).value =
+            config.keys.deepseek;
+
+        page.querySelector(
+            "#save"
         ).onclick = () => {
-            saveConfig({
+
+            saveSettings({
                 provider:
                     page.querySelector(
-                        "#mbgee-provider"
+                        "#provider"
                     ).value,
 
-                apiKey:
-                    page.querySelector(
-                        "#mbgee-key"
-                    ).value.trim()
+                keys: {
+                    gemini:
+                        page.querySelector(
+                            "#gemini"
+                        ).value.trim(),
+
+                    openai:
+                        page.querySelector(
+                            "#openai"
+                        ).value.trim(),
+
+                    claude:
+                        page.querySelector(
+                            "#claude"
+                        ).value.trim(),
+
+                    deepseek:
+                        page.querySelector(
+                            "#deepseek"
+                        ).value.trim()
+                }
             });
 
             openWriter();
         };
 
         page.querySelector(
-            "#mbgee-back"
+            "#back"
         ).onclick =
             openWriter;
     }
 
     function openWriter() {
         const config =
-            getConfig();
+            loadSettings();
 
         page.innerHTML = `
-            <div class="mbgee-app">
+            <div class="mbgee">
 
-                <div class="mbgee-header">
+                <div class="header">
 
                     <div>
                         <h2>
-                            MBGee Continue
+                            MBGee AI
                         </h2>
 
-                        <p>
-                            AI coding assistant
-                        </p>
+                        <small>
+                            ${getLanguage()}
+                        </small>
                     </div>
 
-                    <button id="mbgee-settings">
+                    <button
+                        id="settings"
+                    >
                         ⚙
                     </button>
 
                 </div>
 
-                <label>
-                    Your instruction
-                </label>
+                <div class="tabs">
 
-                <textarea
-                    id="mbgee-prompt"
-                    placeholder="Tell MBGee what you want to write..."
-                ></textarea>
-
-                <button
-                    id="mbgee-continue"
-                    class="primary big"
-                >
-                    Continue Writing
-                </button>
-
-                <button
-                    id="mbgee-stop"
-                >
-                    Stop
-                </button>
-
-                <div class="buttons">
-
-                    <button id="mbgee-generate">
-                        Generate
+                    <button
+                        id="tab-chat"
+                        class="active"
+                    >
+                        Chat
                     </button>
 
-                    <button id="mbgee-fix">
-                        Fix
-                    </button>
-
-                    <button id="mbgee-complete">
-                        Complete
+                    <button
+                        id="tab-code"
+                    >
+                        Code
                     </button>
 
                 </div>
 
                 <div
-                    id="mbgee-status"
-                    class="status"
+                    id="chat-view"
                 >
-                    ${
-                        config.apiKey
-                        ? "Ready."
-                        : "API key required."
-                    }
+
+                    <div
+                        id="mbgee-chat-output"
+                        class="chat"
+                    >
+                        <div class="ai-msg">
+                            <b>MBGee:</b>
+                            Ready. Ask me about
+                            your code.
+                        </div>
+                    </div>
+
+                    <textarea
+                        id="mbgee-chat"
+                        placeholder="Ask MBGee anything about your code..."
+                    ></textarea>
+
+                    <button
+                        id="send"
+                        class="primary"
+                    >
+                        Send to AI
+                    </button>
+
                 </div>
 
-                <div class="info">
+                <div
+                    id="code-view"
+                    class="hidden"
+                >
+
+                    <textarea
+                        id="mbgee-prompt"
+                        placeholder="Tell MBGee what to write..."
+                    ></textarea>
+
+                    <button
+                        id="continue"
+                        class="primary big"
+                    >
+                        Continue Writing
+                    </button>
+
+                    <button
+                        id="stop"
+                    >
+                        Stop
+                    </button>
+
+                    <div class="actions">
+
+                        <button
+                            id="generate"
+                        >
+                            Generate
+                        </button>
+
+                        <button
+                            id="fix"
+                        >
+                            Fix
+                        </button>
+
+                        <button
+                            id="complete"
+                        >
+                            Complete
+                        </button>
+
+                    </div>
+
+                    <div
+                        id="mbgee-status"
+                        class="status"
+                    >
+                        Ready.
+                    </div>
+
+                </div>
+
+                <div class="footer">
+
                     Provider:
                     <b>
                         ${config.provider}
                     </b>
-                </div>
 
-                <div class="contributor">
+                    <br>
+
                     Contributor:
                     macdonaldbarasa2026-del
+
                 </div>
 
             </div>
@@ -917,51 +1263,117 @@ No explanation.
         page.show();
 
         page.querySelector(
-            "#mbgee-settings"
+            "#settings"
         ).onclick =
             openSettings;
 
         page.querySelector(
-            "#mbgee-continue"
+            "#send"
         ).onclick =
-            startWriting;
+            chat;
 
         page.querySelector(
-            "#mbgee-stop"
+            "#continue"
         ).onclick =
-            stopWriting;
+            continueCode;
 
         page.querySelector(
-            "#mbgee-generate"
+            "#stop"
+        ).onclick =
+            stop;
+
+        page.querySelector(
+            "#generate"
         ).onclick = () => {
+
             page.querySelector(
                 "#mbgee-prompt"
             ).value =
-                "Generate the code I describe.";
+                "Generate the code requested by the user.";
 
-            startWriting();
+            continueCode();
         };
 
         page.querySelector(
-            "#mbgee-fix"
+            "#fix"
         ).onclick = () => {
+
             page.querySelector(
                 "#mbgee-prompt"
             ).value =
-                "Fix the current code and continue.";
+                "Fix the current code.";
 
-            startWriting();
+            continueCode();
         };
 
         page.querySelector(
-            "#mbgee-complete"
+            "#complete"
         ).onclick = () => {
+
             page.querySelector(
                 "#mbgee-prompt"
             ).value =
-                "Complete the current code from the cursor.";
+                "Complete the current code.";
 
-            startWriting();
+            continueCode();
+        };
+
+        const chatTab =
+            page.querySelector(
+                "#tab-chat"
+            );
+
+        const codeTab =
+            page.querySelector(
+                "#tab-code"
+            );
+
+        const chatView =
+            page.querySelector(
+                "#chat-view"
+            );
+
+        const codeView =
+            page.querySelector(
+                "#code-view"
+            );
+
+        chatTab.onclick = () => {
+
+            chatTab.classList.add(
+                "active"
+            );
+
+            codeTab.classList.remove(
+                "active"
+            );
+
+            chatView.classList.remove(
+                "hidden"
+            );
+
+            codeView.classList.add(
+                "hidden"
+            );
+        };
+
+        codeTab.onclick = () => {
+
+            codeTab.classList.add(
+                "active"
+            );
+
+            chatTab.classList.remove(
+                "active"
+            );
+
+            codeView.classList.remove(
+                "hidden"
+            );
+
+            chatView.classList.add(
+                "hidden"
+            );
         };
     }
 
@@ -972,53 +1384,48 @@ No explanation.
             );
 
         style.textContent = `
-            .mbgee-app {
-                padding: 16px;
+            .mbgee {
+                padding: 14px;
                 font-family: sans-serif;
             }
 
-            .mbgee-app h2 {
-                margin: 0 0 4px;
-            }
-
-            .subtitle {
-                opacity: .7;
-                margin-top: 0;
-            }
-
-            .mbgee-header {
+            .header {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
+                margin-bottom: 12px;
             }
 
-            .mbgee-app label {
+            .header h2 {
+                margin: 0;
+            }
+
+            .header small {
+                opacity: .65;
+            }
+
+            .tabs {
+                display: flex;
+                gap: 6px;
+                margin-bottom: 12px;
+            }
+
+            .tabs button {
+                flex: 1;
+            }
+
+            .mbgee label {
                 display: block;
-                margin-top: 16px;
-                margin-bottom: 6px;
+                margin-top: 12px;
+                margin-bottom: 5px;
             }
 
-            .mbgee-app input,
-            .mbgee-app textarea,
-            .mbgee-app select {
+            .mbgee input,
+            .mbgee select,
+            .mbgee textarea {
                 width: 100%;
                 box-sizing: border-box;
-                padding: 12px;
-                border-radius: 8px;
-                border: 1px solid #777;
-                background: transparent;
-                color: inherit;
-                font-size: 15px;
-            }
-
-            .mbgee-app textarea {
-                min-height: 110px;
-                resize: vertical;
-            }
-
-            .mbgee-app button {
-                padding: 11px 14px;
-                margin-top: 10px;
+                padding: 11px;
                 border-radius: 8px;
                 border: 1px solid #777;
                 background: transparent;
@@ -1026,48 +1433,88 @@ No explanation.
                 font-size: 14px;
             }
 
-            .mbgee-app button.primary {
+            .mbgee textarea {
+                min-height: 95px;
+                resize: vertical;
+            }
+
+            .mbgee button {
+                border: 1px solid #777;
+                background: transparent;
+                color: inherit;
+                padding: 10px 12px;
+                border-radius: 8px;
+                margin-top: 8px;
+            }
+
+            .mbgee button.primary {
                 width: 100%;
-                border: 0;
                 font-weight: bold;
             }
 
-            .mbgee-app button.big {
-                padding: 15px;
-                font-size: 16px;
+            .mbgee button.big {
+                padding: 14px;
+                font-size: 15px;
             }
 
-            .mbgee-app .buttons {
+            .actions {
                 display: flex;
-                gap: 7px;
+                gap: 6px;
             }
 
-            .mbgee-app .buttons button {
+            .actions button {
                 flex: 1;
             }
 
+            .chat {
+                min-height: 240px;
+                max-height: 48vh;
+                overflow-y: auto;
+                padding: 8px;
+                border: 1px solid #555;
+                border-radius: 8px;
+                margin-bottom: 8px;
+            }
+
+            .user-msg,
+            .ai-msg {
+                margin-bottom: 12px;
+                line-height: 1.45;
+            }
+
+            .user-msg {
+                opacity: .85;
+            }
+
+            .ai-msg {
+                white-space: pre-wrap;
+            }
+
             .status {
-                margin-top: 16px;
+                margin-top: 12px;
                 padding: 10px;
                 border-radius: 8px;
                 background: rgba(128,128,128,.15);
             }
 
-            .info {
-                margin-top: 12px;
-                opacity: .8;
-            }
-
-            .contributor {
-                margin-top: 20px;
-                font-size: 12px;
-                opacity: .6;
+            .footer {
+                margin-top: 18px;
                 text-align: center;
+                font-size: 11px;
+                opacity: .6;
             }
 
-            .small {
-                font-size: 12px;
+            .privacy {
+                font-size: 11px;
                 opacity: .6;
+            }
+
+            .hidden {
+                display: none;
+            }
+
+            .tabs .active {
+                font-weight: bold;
             }
         `;
 
@@ -1093,15 +1540,19 @@ No explanation.
             );
 
         commands.addCommand({
-            name: COMMAND_ID,
+            name:
+                COMMAND_ID,
+
             description:
-                "Open MBGee AI Writer",
-            exec: openWriter
+                "Open MBGee AI",
+
+            exec:
+                openWriter
         });
     }
 
     function unmount() {
-        stopWriting();
+        stop();
 
         const commands =
             acode.require(
